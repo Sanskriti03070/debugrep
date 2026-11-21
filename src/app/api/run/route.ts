@@ -1,29 +1,23 @@
 import { NextResponse } from "next/server";
+import { HIDDEN_TESTS } from "@/data/hiddenTests";
 
-// Security Limits (Bouncer rules: ye cross kiya toh Modal tak request jayegi hi nahi)
+// Security Limits (Front-door bouncer rules)
 const MAX_FILES = 20;
-const MAX_TOTAL_BYTES = 100 * 1024; // 100 KB max total code size
-
-// Safe filename regex: sirf letters, numbers, folders (/), underscores, aur .java allowed
+const MAX_TOTAL_BYTES = 100 * 1024; // 100 KB max
 const SAFE_PATH_REGEX = /^[a-zA-Z0-9_/-]+\.java$/;
-
-// Safe Java class name regex: e.g., "Main" ya "com.app.Main" (no spaces, no shell characters)
-const SAFE_CLASS_REGEX = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
 
 export async function POST(req: Request) {
   const startTime = Date.now();
 
   try {
     const body = await req.json();
-    const { entryClass, files } = body;
+    const { problemId, files } = body;
 
-    // 1. Basic structure check: entryClass string hona chahiye aur files ek non-empty object
-    if (
-      typeof entryClass !== "string" ||
-      !SAFE_CLASS_REGEX.test(entryClass)
-    ) {
+    // 1. Server-side lookup: problemId se hidden tests aur entryClass nikalo (browser pe trust mat karo!)
+    const hiddenConfig = typeof problemId === "string" ? HIDDEN_TESTS[problemId] : undefined;
+    if (!hiddenConfig) {
       return NextResponse.json(
-        { success: false, stage: "validation", stderr: "Invalid entryClass name." },
+        { success: false, stage: "validation", stderr: `Unknown problemId: "${problemId}".` },
         { status: 400 }
       );
     }
@@ -36,8 +30,6 @@ export async function POST(req: Request) {
     }
 
     const fileEntries = Object.entries(files);
-
-    // 2. File count check: koi 10,000 files bhej ke server crash na kar de
     if (fileEntries.length === 0 || fileEntries.length > MAX_FILES) {
       return NextResponse.json(
         { success: false, stage: "validation", stderr: `File count must be between 1 and ${MAX_FILES}.` },
@@ -47,7 +39,7 @@ export async function POST(req: Request) {
 
     let totalBytes = 0;
 
-    // 3. Har ek file ko inspect karo (Path Traversal + Size Bomb protection)
+    // 2. Har user file ko validate karo (Path Traversal + Payload Size Bomb check)
     for (const [filename, content] of fileEntries) {
       if (typeof content !== "string") {
         return NextResponse.json(
@@ -56,7 +48,6 @@ export async function POST(req: Request) {
         );
       }
 
-      // Path Traversal check: "..", leading "/", ya illegal characters turant block karo
       if (
         filename.includes("..") ||
         filename.startsWith("/") ||
@@ -85,7 +76,13 @@ export async function POST(req: Request) {
       }
     }
 
-    // 4. Sab clean hai! Ab Modal sandbox URL check karke request forward karo
+    // 3. ANTI-CHEAT INJECTION: User files ke upar server ke hidden tests merge karo
+    // Agar user ne fake HiddenGrader.java bheja bhi hoga, toh server wala usko overwrite kar dega!
+    const mergedFiles = {
+      ...files,
+      ...hiddenConfig.testFiles,
+    };
+
     const modalUrl = process.env.MODAL_JAVA_RUNNER_URL;
     if (!modalUrl) {
       return NextResponse.json(
@@ -94,10 +91,14 @@ export async function POST(req: Request) {
       );
     }
 
+    // 4. Merged VFS ko Modal Java 21 sandbox mein bhejo
     const modalRes = await fetch(modalUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entryClass, files }),
+      body: JSON.stringify({
+        entryClass: hiddenConfig.entryClass,
+        files: mergedFiles,
+      }),
     });
 
     if (!modalRes.ok) {
